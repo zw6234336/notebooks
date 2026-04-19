@@ -164,3 +164,135 @@
 如果要继续往强化学习推进，再做这个：
 
 2. 基于同一个本地 Gemma 4 26B A4B，改造 [nb/Gemma4_(E2B)_GRPO.ipynb](nb/Gemma4_(E2B)_GRPO.ipynb)
+
+---
+
+## 小模型方向：中文金融保险意图分类
+
+### 背景
+
+如果目标不是大模型强化学习，而是做一个轻量、快速部署的意图分类服务，推荐走以下路线。
+
+### 推荐路线：路线 A（Encoder + 分类头）
+
+**适合场景：** 标签固定、有标注数据、推理速度要求高。
+
+工作原理：
+```
+用户输入："我要申请理赔"
+      ↓ 中文 BERT 编码器
+    [句向量]
+      ↓ 线性分类层
+  输出：意图 = "理赔申请" (置信度 0.96)
+```
+
+**推荐模型：** `hfl/chinese-macbert-base`（哈工大出品，中文垂直领域表现稳定）
+
+**对应脚本：** [python_scripts/ChineseFinance_Intent_Classification.py](python_scripts/ChineseFinance_Intent_Classification.py)
+
+该脚本基于仓库原有 `bert_classification.py` 改造，已包含：
+- 10 个默认金融保险意图标签（可直接增删）
+- 中文分词和截断配置
+- 加权 F1 评估指标（比纯 accuracy 更适合不平衡类别）
+- 三种数据加载方式的注释
+
+### 10 个默认意图标签
+
+| ID | 意图 |
+|----|------|
+| 0 | 理赔申请 |
+| 1 | 产品咨询 |
+| 2 | 保费查询 |
+| 3 | 投保申请 |
+| 4 | 保单变更 |
+| 5 | 退保申请 |
+| 6 | 续保服务 |
+| 7 | 账户管理 |
+| 8 | 紧急求助 |
+| 9 | 投诉建议 |
+
+### 训练数据准备方法
+
+#### 方式 1：用大模型生成（最快，约 10 分钟）
+
+在 ChatGPT / Claude / 本机 Qwen 大模型里发如下提示词，让它批量生成样本：
+
+```
+你是一个金融保险领域的数据标注专家。
+请为以下10个意图类别各生成30条用户真实问句，要求：
+1. 语言口语化，模拟真实用户打字风格
+2. 同一意图下问法要有变化，避免重复模板
+3. 输出格式为 CSV，字段为：text,label_id,label_name
+
+意图列表：
+0,理赔申请
+1,产品咨询
+2,保费查询
+3,投保申请
+4,保单变更
+5,退保申请
+6,续保服务
+7,账户管理
+8,紧急求助
+9,投诉建议
+```
+
+保存为 `train.csv`，脚本里替换数据加载代码：
+
+```python
+from datasets import load_dataset
+dataset = load_dataset("csv", data_files={"train": "train.csv"})
+split_dataset = dataset["train"].train_test_split(test_size=0.2, seed=42)
+```
+
+#### 方式 2：挖现有业务数据（最真实）
+
+如果有客服系统、工单系统或对话日志，用关键词做快速粗标签跑通流程，再人工核对少量不确定样本：
+
+```python
+import pandas as pd
+
+df = pd.read_csv("raw_customer_queries.csv")
+
+keyword_map = {
+    "理赔": 0, "报销": 0, "赔付": 0,
+    "什么险": 1, "区别": 1, "保障什么": 1,
+    "保费": 2, "扣款": 2, "多少钱": 2,
+    "购买": 3, "投保": 3, "想买": 3,
+    "变更": 4, "修改": 4, "更新": 4,
+    "退保": 5, "取消": 5,
+    "续保": 6, "续费": 6,
+    "密码": 7, "登录": 7, "保单列表": 7,
+    "紧急": 8, "救援": 8, "事故": 8,
+    "投诉": 9, "建议": 9, "不满意": 9,
+}
+
+def auto_label(text):
+    for kw, label in keyword_map.items():
+        if kw in text:
+            return label
+    return -1  # -1 表示需要人工确认
+
+df["label"] = df["text"].apply(auto_label)
+df[df["label"] >= 0].to_csv("train.csv", index=False)
+df[df["label"] < 0].to_csv("to_review.csv", index=False)  # 人工标注这部分
+```
+
+#### 方式 3：Label Studio 可视化标注
+
+```bash
+pip install label-studio
+label-studio start
+```
+
+导入文本文件，选 Text Classification，点击标注，导出 CSV。适合团队协作。
+
+### 数据量建议
+
+| 阶段 | 每类最少样本 | 总计 |
+|------|------------|------|
+| 快速验证流程 | 20 条 | ~200 条 |
+| 达到可用精度 | 100 条 | ~1000 条 |
+| 生产级别 | 500+ 条 | ~5000+ 条 |
+
+建议从方式 1 的大模型生成开始（每类 30 条，共 300 条）先跑通整个训练流程，再逐步替换为真实业务数据。

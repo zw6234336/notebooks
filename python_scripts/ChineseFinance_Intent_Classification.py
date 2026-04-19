@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# 中文金融保险意图分类 - 基于 Unsloth + BERT 路线
+# 中文金融保险多意图识别 - 基于 Unsloth + BERT 路线
+# 模式：multi-label（一句话可同时触发多个意图）
 # 使用 hfl/chinese-macbert-base 作为骨干编码器，通过 AutoModelForSequenceClassification 添加分类头
+# 损失函数：BCEWithLogitsLoss（每个意图独立二分类）
 # 训练框架: Unsloth FastModel + HuggingFace Trainer
 
 # ### 安装依赖
@@ -51,6 +53,7 @@ model, tokenizer = FastModel.from_pretrained(
     full_finetuning = True,   # 全量微调，数据少时可改为 False 并用 LoRA
     id2label = id2label,
     label2id = label2id,
+    problem_type = "multi_label_classification",  # 多意图：每个标签独立 sigmoid + BCE
     load_in_4bit = load_in_4bit,
 )
 
@@ -69,93 +72,63 @@ model, tokenizer = FastModel.from_pretrained(
 
 
 # ============================================================
-# 数据准备
+# 数据准备（multi-label 格式）
 # ============================================================
-# 选项 1：直接从本地 CSV/JSON 加载
-#   每条样本需要两个字段：
-#     - "text"  : 用户的中文问题字符串
-#     - "label" : 对应的意图 id（整数，0 ~ num_labels-1）
+# 多意图识别中，每条样本的标签是一个 float 多热向量，长度 = num_labels
+# 例如同时触发「理赔申请」和「投诉建议」时：
+#   labels = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
 #
-# from datasets import load_dataset
-# dataset = load_dataset("csv", data_files={"train": "train.csv", "test": "test.csv"})
+# 选项 1：从本地 CSV 加载
+#   CSV 格式：text 列 + 每个意图一列（0/1），或 text + labels 列（逗号分隔的 id）
+#   加载后需调用下面的 encode_labels() 转换为多热向量
 #
-# 选项 2：从 HuggingFace Hub 加载已有中文意图数据集，例如：
-#   dataset = load_dataset("thu-coai/LCCC", ...)  # 替换为实际数据集
-#
-# 选项 3（快速验证用）：内联示例数据，仅用于调试流程，请务必替换为真实数据
+# 选项 2（快速验证用）：内联示例数据，包含多意图样本
 
 from datasets import Dataset
+import numpy as np
+
+def make_multilabel(active_ids: list) -> list:
+    """把激活的意图 id 列表转为长度 num_labels 的 float 多热向量"""
+    vec = [0.0] * num_labels
+    for i in active_ids:
+        vec[i] = 1.0
+    return vec
 
 sample_data = [
-    # 理赔申请 (0)
-    {"text": "我要申请理赔，上周发生了交通事故", "label": 0},
-    {"text": "怎么提交理赔申请？需要哪些材料", "label": 0},
-    {"text": "我的住院费用能报销吗", "label": 0},
-    {"text": "理赔审核需要多久", "label": 0},
-    {"text": "我想查一下理赔进度", "label": 0},
+    # 单意图样本
+    {"text": "我要申请理赔，上周发生了交通事故",         "labels": make_multilabel([0])},
+    {"text": "怎么提交理赔申请？需要哪些材料",           "labels": make_multilabel([0])},
+    {"text": "理赔审核需要多久",                        "labels": make_multilabel([0])},
+    {"text": "重疾险和医疗险有什么区别",                "labels": make_multilabel([1])},
+    {"text": "你们有哪些适合老人的保险产品",             "labels": make_multilabel([1])},
+    {"text": "我的保费是多少，什么时候扣款",             "labels": make_multilabel([2])},
+    {"text": "为什么这次保费比上次多",                  "labels": make_multilabel([2])},
+    {"text": "我想给孩子买一份教育金险",                "labels": make_multilabel([3])},
+    {"text": "怎么在线投保重疾险",                     "labels": make_multilabel([3])},
+    {"text": "我要修改受益人信息",                     "labels": make_multilabel([4])},
+    {"text": "我想变更缴费方式，从年缴改为月缴",         "labels": make_multilabel([4])},
+    {"text": "我想退保，能退多少钱",                   "labels": make_multilabel([5])},
+    {"text": "退保会有损失吗",                        "labels": make_multilabel([5])},
+    {"text": "我的保险快到期了，怎么续保",              "labels": make_multilabel([6])},
+    {"text": "续保后保障内容会变吗",                   "labels": make_multilabel([6])},
+    {"text": "我忘记登录密码了",                      "labels": make_multilabel([7])},
+    {"text": "电子保单怎么下载",                      "labels": make_multilabel([7])},
+    {"text": "我现在出了车祸，需要紧急救援",             "labels": make_multilabel([8])},
+    {"text": "请问24小时紧急救援电话是多少",            "labels": make_multilabel([8])},
+    {"text": "我对理赔结果不满意，想投诉",              "labels": make_multilabel([9])},
+    {"text": "你们的客服态度很差，我要投诉",            "labels": make_multilabel([9])},
 
-    # 产品咨询 (1)
-    {"text": "重疾险和医疗险有什么区别", "label": 1},
-    {"text": "你们有哪些适合老人的保险产品", "label": 1},
-    {"text": "这款意外险保障哪些情况", "label": 1},
-    {"text": "百万医疗险的免赔额是多少", "label": 1},
-    {"text": "分红险的收益是怎么算的", "label": 1},
-
-    # 保费查询 (2)
-    {"text": "我的保费是多少，什么时候扣款", "label": 2},
-    {"text": "下个月保费要到期了，金额是多少", "label": 2},
-    {"text": "为什么这次保费比上次多", "label": 2},
-    {"text": "查一下我的年缴保费", "label": 2},
-    {"text": "续费金额怎么查", "label": 2},
-
-    # 投保申请 (3)
-    {"text": "我想给孩子买一份教育金险", "label": 3},
-    {"text": "怎么在线投保重疾险", "label": 3},
-    {"text": "我想投保寿险，需要体检吗", "label": 3},
-    {"text": "能帮我推荐一款适合我的健康险吗", "label": 3},
-    {"text": "我要购买一份意外险", "label": 3},
-
-    # 保单变更 (4)
-    {"text": "我要修改受益人信息", "label": 4},
-    {"text": "能帮我把保额升级吗", "label": 4},
-    {"text": "我想变更缴费方式，从年缴改为月缴", "label": 4},
-    {"text": "保单地址需要更新", "label": 4},
-    {"text": "联系方式变了，怎么修改", "label": 4},
-
-    # 退保申请 (5)
-    {"text": "我想退保，能退多少钱", "label": 5},
-    {"text": "退保流程是什么", "label": 5},
-    {"text": "我要取消这份保险", "label": 5},
-    {"text": "退保会有损失吗", "label": 5},
-    {"text": "我要申请退保，请告诉我步骤", "label": 5},
-
-    # 续保服务 (6)
-    {"text": "我的保险快到期了，怎么续保", "label": 6},
-    {"text": "自动续保是怎么扣款的", "label": 6},
-    {"text": "能帮我办理续保吗", "label": 6},
-    {"text": "续保后保障内容会变吗", "label": 6},
-    {"text": "我要手动续费", "label": 6},
-
-    # 账户管理 (7)
-    {"text": "我忘记登录密码了", "label": 7},
-    {"text": "怎么修改账户绑定的手机号", "label": 7},
-    {"text": "我想查看我的保单列表", "label": 7},
-    {"text": "电子保单怎么下载", "label": 7},
-    {"text": "账户余额怎么查询", "label": 7},
-
-    # 紧急求助 (8)
-    {"text": "我现在出了车祸，需要紧急救援", "label": 8},
-    {"text": "客户突发心脏病在医院，如何紧急理赔", "label": 8},
-    {"text": "请问24小时紧急救援电话是多少", "label": 8},
-    {"text": "我在国外住院，怎么启动境外紧急服务", "label": 8},
-    {"text": "紧急救援怎么申请", "label": 8},
-
-    # 投诉建议 (9)
-    {"text": "我对理赔结果不满意，想投诉", "label": 9},
-    {"text": "你们的客服态度很差，我要投诉", "label": 9},
-    {"text": "我有个建议，希望改进你们的App", "label": 9},
-    {"text": "上次理赔被无理拒绝，我要投诉", "label": 9},
-    {"text": "对保险条款有意见，想反映一下", "label": 9},
+    # 多意图样本（同时触发多个意图）
+    {"text": "我出了车祸，需要紧急救援，同时想申请理赔",  "labels": make_multilabel([0, 8])},
+    {"text": "我住院了，能申请理赔吗？需要先了解一下保障范围", "labels": make_multilabel([0, 1])},
+    {"text": "我想买重疾险，保费大概多少",              "labels": make_multilabel([1, 2])},
+    {"text": "我想买一份健康险，然后把旧保单退掉",       "labels": make_multilabel([3, 5])},
+    {"text": "这款产品续保时保费会涨吗",               "labels": make_multilabel([1, 2, 6])},
+    {"text": "我要投保，同时把之前的联系方式改一下",     "labels": make_multilabel([3, 4])},
+    {"text": "理赔被拒了，我想投诉，同时了解一下重新申请的流程", "labels": make_multilabel([0, 9])},
+    {"text": "我要申请退保，退保金额能直接转到账户里吗",  "labels": make_multilabel([5, 7])},
+    {"text": "续保的同时帮我把受益人改成我老婆",        "labels": make_multilabel([4, 6])},
+    {"text": "出了紧急事故，理赔进度怎么查",            "labels": make_multilabel([0, 8])},
 ]
 
 raw_dataset = Dataset.from_list(sample_data)
@@ -174,38 +147,44 @@ def tokenize_function(examples):
 
 train_dataset = split_dataset["train"].map(tokenize_function, batched=True)
 val_dataset   = split_dataset["test"].map(tokenize_function, batched=True)
-
-# Trainer 需要字段名为 "labels"（注意复数）
-train_dataset = train_dataset.rename_column("label", "labels")
-val_dataset   = val_dataset.rename_column("label", "labels")
+# labels 字段已经是 float 多热向量，不需要 rename
 
 
 # ============================================================
-# 类别权重（用于不平衡数据集）
+# 每标签正样本权重（multi-label 不平衡处理）
+# pos_weight[i] = 负样本数 / 正样本数，传给 BCEWithLogitsLoss
 # ============================================================
-from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
 
-labels_array = train_dataset["labels"]
-class_weights = compute_class_weight(
-    "balanced",
-    classes=np.arange(num_labels),
-    y=labels_array,
-)
-print("类别权重:", class_weights)
+labels_matrix = np.array(train_dataset["labels"])  # shape: (N, num_labels)
+pos_count = labels_matrix.sum(axis=0).clip(min=1)   # 每列正样本数
+neg_count = len(labels_matrix) - pos_count
+pos_weight = torch.tensor(neg_count / pos_count, dtype=torch.float32)
+print("每意图正样本权重:", {id2label[i]: f"{pos_weight[i]:.2f}" for i in range(num_labels)})
 
 
 # ============================================================
-# 评估指标：准确率 + 加权 F1（金融保险场景更关注 F1）
+# 评估指标（multi-label）
 # ============================================================
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import f1_score, classification_report
+
+THRESHOLD = 0.5  # sigmoid 输出超过此阈值则认为该意图被触发，可调整
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
-    preds = logits.argmax(axis=-1)
-    acc = accuracy_score(labels, preds)
-    f1  = f1_score(labels, preds, average="weighted")
-    return {"accuracy": acc, "f1_weighted": f1}
+    # logits -> sigmoid -> 二值化
+    probs = 1 / (1 + np.exp(-logits))       # sigmoid，shape: (N, num_labels)
+    preds = (probs >= THRESHOLD).astype(int)
+    labels = np.array(labels).astype(int)
+
+    f1_micro  = f1_score(labels, preds, average="micro",    zero_division=0)
+    f1_macro  = f1_score(labels, preds, average="macro",    zero_division=0)
+    f1_sample = f1_score(labels, preds, average="samples",  zero_division=0)
+    return {
+        "f1_micro":   f1_micro,
+        "f1_macro":   f1_macro,
+        "f1_samples": f1_sample,
+    }
 
 
 # ============================================================
@@ -216,12 +195,12 @@ from unsloth import is_bfloat16_supported
 
 training_args = TrainingArguments(
     output_dir = "outputs/chinese_finance_intent",
-    num_train_epochs = 5,             # BERT 风格模型通常需要多个 epoch
-    per_device_train_batch_size = 32,
-    per_device_eval_batch_size  = 32,
-    gradient_accumulation_steps = 1,
+    num_train_epochs = 5,
+    per_device_train_batch_size = 16,   # multi-label 样本稍大，batch 适当缩小
+    per_device_eval_batch_size  = 16,
+    gradient_accumulation_steps = 2,
     warmup_ratio = 0.1,
-    learning_rate = 3e-5,             # 中文 BERT 微调推荐 2e-5 ~ 5e-5
+    learning_rate = 3e-5,
     fp16 = not is_bfloat16_supported(),
     bf16 = is_bfloat16_supported(),
     logging_steps = 5,
@@ -230,13 +209,28 @@ training_args = TrainingArguments(
     eval_strategy = "epoch",
     save_strategy = "epoch",
     load_best_model_at_end = True,
-    metric_for_best_model = "f1_weighted",
+    metric_for_best_model = "f1_micro",  # multi-label 常用 micro F1 作为主指标
     greater_is_better = True,
     seed = 3407,
     report_to = "none",
 )
 
-trainer = Trainer(
+# 自定义 Trainer：注入 pos_weight 到 BCEWithLogitsLoss
+class MultiLabelTrainer(Trainer):
+    def __init__(self, pos_weight=None, **kwargs):
+        super().__init__(**kwargs)
+        self.pos_weight = pos_weight.to(self.model.device) if pos_weight is not None else None
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels").float()
+        outputs = model(**inputs)
+        logits = outputs.logits
+        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        loss = loss_fn(logits, labels)
+        return (loss, outputs) if return_outputs else loss
+
+trainer = MultiLabelTrainer(
+    pos_weight = pos_weight,
     model = model,
     processing_class = tokenizer,
     train_dataset = train_dataset,
@@ -249,30 +243,47 @@ trainer_stats = trainer.train()
 
 
 # ============================================================
-# 推理验证
+# 推理验证（multi-label：sigmoid + 阈值，可同时输出多个意图）
 # ============================================================
-from transformers import pipeline
+model.eval()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
 
-classifier = pipeline(
-    "text-classification",
-    model = model,
-    tokenizer = tokenizer,
-    device = 0 if torch.cuda.is_available() else -1,
-)
+def predict_intents(text: str, threshold: float = THRESHOLD):
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_seq_length,
+    ).to(device)
+    with torch.no_grad():
+        logits = model(**inputs).logits[0]          # shape: (num_labels,)
+    probs = torch.sigmoid(logits).cpu().numpy()
+    results = [
+        {"intent": id2label[i], "score": float(probs[i])}
+        for i in range(num_labels) if probs[i] >= threshold
+    ]
+    # 按置信度降序
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
 
 test_sentences = [
     "我要申请理赔，材料已经准备好了",
-    "你们有没有适合30岁女性的重疾险",
-    "我想退保，请问需要哪些手续",
-    "我的密码忘了，怎么找回",
-    "对上次的理赔结果不满意，想投诉",
+    "你们有没有适合30岁女性的重疾险，保费大概多少",
+    "我出了车祸，需要紧急救援，同时想了解理赔流程",
+    "我想退保，退保金可以转到我账户里吗",
+    "对上次的理赔结果不满意，想投诉，同时想重新申请",
 ]
 
-print("\n意图分类推理结果：")
+print("\n多意图识别推理结果：")
 for s in test_sentences:
-    result = classifier(s)[0]
+    intents = predict_intents(s)
     print(f"  输入: {s}")
-    print(f"  意图: {result['label']}  置信度: {result['score']:.4f}")
+    if intents:
+        for it in intents:
+            print(f"    → {it['intent']}  ({it['score']:.4f})")
+    else:
+        print(f"    → 未识别到意图（所有意图概率 < {THRESHOLD}）")
     print()
 
 
